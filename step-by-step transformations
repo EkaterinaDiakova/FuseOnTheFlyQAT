@@ -1,0 +1,289 @@
+def scale_conv_weights_by_scalar_thresh(state_dict):
+
+    new_state_dict = state_dict.copy()
+    keys = list(state_dict.keys())
+    
+    processed = 0
+    i = 0
+    while i < len(keys) - 1:
+        current_key = keys[i]
+        next_key = keys[i + 1]
+        if (current_key.endswith('.thresh') and 
+            next_key.endswith('.weight')):
+            
+            thresh_scalar = state_dict[current_key][0].item()  
+            conv_weight = new_state_dict[next_key]
+            
+            new_state_dict[next_key] = conv_weight * thresh_scalar
+            processed += 1
+            print(f"{next_key} *= {thresh_scalar:.3f}")
+        
+        i += 1
+    
+    print(f"\nОбработано conv слоев: {processed}")
+    return new_state_dict
+
+def add_full_shortcut_scaling(model, old_state_dict):
+
+    shortcut_scales = {
+
+        'conv2_x.0': old_state_dict['conv1.2.thresh'][0].item(),        # 0.990
+        'conv2_x.1': old_state_dict['conv2_x.0.act.thresh'][0].item(),  # 1.833  
+        'conv2_x.2': old_state_dict['conv2_x.1.act.thresh'][0].item(),  # 2.004
+
+        'conv3_x.0': old_state_dict['conv2_x.2.act.thresh'][0].item(),  # 2.413
+        'conv3_x.1': old_state_dict['conv3_x.0.act.thresh'][0].item(),  # 1.786
+        'conv3_x.2': old_state_dict['conv3_x.1.act.thresh'][0].item(),  # 2.063
+
+        'conv4_x.0': old_state_dict['conv3_x.2.act.thresh'][0].item(),  # 2.436
+        'conv4_x.1': old_state_dict['conv4_x.0.act.thresh'][0].item(),  # 1.791
+        'conv4_x.2': old_state_dict['conv4_x.1.act.thresh'][0].item()   # 2.094
+    }
+    
+    print("\nВСЕ Shortcut масштабы:")
+    for block_name, scale in shortcut_scales.items():
+        print(f"{block_name} shortcut input *= {scale:.3f}")
+    
+    for i, block_name in enumerate(['conv2_x', 'conv3_x', 'conv4_x']):
+        for j in range(3): 
+            block = getattr(model, block_name)[j]
+            scale = shortcut_scales[f'{block_name}.{j}']
+            
+            def make_patch(block, scale):
+                def new_forward(self, x):
+                    if len(block.shortcut) == 0:  
+                        identity = x * scale
+                    else:  
+                        identity = block.shortcut(x * scale)
+                    
+                    out = block.residual_function(x)
+                    out += identity
+                    return block.act(out)
+                return new_forward.__get__(block)
+            
+            block.forward = make_patch(block, scale)
+    
+    return model
+def full_conversion(old_state_dict):
+    model = modelpool(args['model'], args['dataset'])
+    
+    new_state_dict = scale_conv_weights_by_scalar_thresh(old_state_dict)
+    model.load_state_dict(new_state_dict)
+    
+    model = add_full_shortcut_scaling(model, old_state_dict)
+    
+    return model
+
+
+class NormalizedResNet4Cifar(type(model)):
+    def __init__(self, original_model):
+        self.__dict__.update(original_model.__dict__)
+        
+        self.thresh_value = None
+        for name, param in self.named_parameters():
+            if 'avg_pool_act.thresh' in name:
+                self.thresh_value = param.item()
+                print(f"Thresh: {self.thresh_value}")
+                break
+        
+        if self.thresh_value is None:
+            self.thresh_value = 1.0
+        self.original_forward = self.forward
+        
+        self.forward = self.normalized_forward
+    
+    def normalized_forward(self, x):
+        T = self.T
+        if T > 0:
+            x.unsqueeze_(1)
+            x = x.repeat(T, 1, 1, 1, 1)
+            x = self.merge(x)
+
+        output = self.conv1(x)
+        output = self.conv2_x(output)
+        output = self.conv3_x(output)
+        output = self.conv4_x(output)
+        
+
+        output = output * self.thresh_value
+        
+
+        output = self.avg_pool(output)
+        output = self.avg_pool_act(output)
+        output = output.view(output.size(0), -1)
+        output = self.fc(output)
+        #output = self.fc_act(output)
+        
+        if T > 0:
+            output = self.expand(output)
+        
+        return output
+import copy
+def fuse_conv_bn(conv, bn):
+    fused_conv = nn.Conv2d(
+        conv.in_channels,
+        conv.out_channels,
+        kernel_size=conv.kernel_size,
+        stride=conv.stride,
+        padding=conv.padding,
+        dilation=conv.dilation,
+        groups=conv.groups,
+        bias=True
+    ).to(conv.weight.device)
+    
+    fused_conv.weight.data = conv.weight.data.clone()
+    
+    if conv.bias is not None:
+        fused_conv.bias.data = conv.bias.data.clone()
+    else:
+        fused_conv.bias.data = torch.zeros(conv.out_channels).to(conv.weight.device)
+    
+    bn_mean = bn.running_mean
+    bn_var_sqrt = torch.sqrt(bn.running_var + bn.eps)
+    bn_weight = bn.weight
+    bn_bias = bn.bias
+    
+
+    scale_factor = bn_weight / bn_var_sqrt
+    
+    fused_conv.weight.data = fused_conv.weight.data * scale_factor.reshape(-1, 1, 1, 1)
+    
+    fused_conv.bias.data = (fused_conv.bias.data - bn_mean) * scale_factor + bn_bias
+    
+    return fused_conv
+
+def fuse_all_conv_bn_pairs(module, parent=None, name=None):
+
+    for child_name, child in module.named_children():
+        fuse_all_conv_bn_pairs(child, module, child_name)
+    
+    if isinstance(module, nn.Sequential):
+        modules_to_replace = []
+        
+
+        for i in range(len(module)):
+            if isinstance(module[i], nn.BatchNorm2d):
+                if i > 0 and isinstance(module[i-1], nn.Conv2d):
+                    modules_to_replace.append((i-1, i, module[i-1], module[i]))
+        
+        for conv_idx, bn_idx, conv, bn in reversed(modules_to_replace):
+            fused_conv = fuse_conv_bn(conv, bn)
+            
+            new_modules = []
+            for j in range(len(module)):
+                if j == conv_idx:
+                    new_modules.append(fused_conv)
+                elif j == bn_idx:
+                    continue  
+                else:
+                    new_modules.append(module[j])
+            
+
+            module.__init__(*new_modules)
+
+def fuse_model(model):
+    fused_model = copy.deepcopy(model)
+    
+    fuse_all_conv_bn_pairs(fused_model)
+    
+    return fused_model
+
+def bias_folding_SNN(model):
+    
+    import copy
+    model_copy = copy.deepcopy(model)
+
+    original_state_dict = {k: v.clone().detach() for k, v in model.state_dict().items()}
+    bias_cache = {k: v for k, v in original_state_dict.items() if '.bias' in k}
+    
+    bias_mapping = {
+        'conv1.1': ['conv1.0.bias'],
+        'conv2_x.0.residual_function.1': ['conv2_x.0.residual_function.0.bias'],
+        'conv2_x.0.act': ['conv2_x.0.residual_function.2.bias'],
+        'conv2_x.1.residual_function.1': ['conv2_x.1.residual_function.0.bias'],
+        'conv2_x.1.act': ['conv2_x.1.residual_function.2.bias'],
+        'conv2_x.2.residual_function.1': ['conv2_x.2.residual_function.0.bias'],
+        'conv2_x.2.act': ['conv2_x.2.residual_function.2.bias'],
+        'conv3_x.0.residual_function.1': ['conv3_x.0.residual_function.0.bias'],
+        'conv3_x.0.act': ['conv3_x.0.residual_function.2.bias', 'conv3_x.0.shortcut.0.bias'],
+        'conv3_x.1.residual_function.1': ['conv3_x.1.residual_function.0.bias'],
+        'conv3_x.1.act': ['conv3_x.1.residual_function.2.bias'],
+        'conv3_x.2.residual_function.1': ['conv3_x.2.residual_function.0.bias'],
+        'conv3_x.2.act': ['conv3_x.2.residual_function.2.bias'],
+        'conv4_x.0.residual_function.1': ['conv4_x.0.residual_function.0.bias'],
+        'conv4_x.0.act': ['conv4_x.0.residual_function.2.bias', 'conv4_x.0.shortcut.0.bias'],
+        'conv4_x.1.residual_function.1': ['conv4_x.1.residual_function.0.bias'],
+        'conv4_x.1.act': ['conv4_x.1.residual_function.2.bias'],
+        'conv4_x.2.residual_function.1': ['conv4_x.2.residual_function.0.bias'],
+        'conv4_x.2.act': ['conv4_x.2.residual_function.2.bias'],
+        'avg_pool_act': [],
+        #'fc_act': ['fc.bias']
+    }
+    
+    def create_patched_forward(bias_list, bias_cache_dict):
+        def patched_forward(self, x):
+            total_bias = None
+            for bias_name in bias_list:
+                if bias_name in bias_cache_dict:
+                    bias_tensor = bias_cache_dict[bias_name].to(x.device)
+                    if total_bias is None:
+                        total_bias = bias_tensor.clone()
+                    elif total_bias.shape == bias_tensor.shape:
+                        total_bias += bias_tensor
+            
+            if self.T > 0:
+                thre = self.thresh.data
+              
+                x_expanded = self.expand(x)
+                cur_sample = x_expanded[0]
+                mem = torch.zeros_like(cur_sample)
+                mem += 0.5 * thre.expand_as(mem)
+                
+                if total_bias is not None:
+                    if len(mem.shape) == 4:
+                        bias_expanded = total_bias.view(1, -1, 1, 1).expand_as(mem)
+                    else:
+                        bias_expanded = total_bias.view(1, -1).expand_as(mem)
+                    mem += bias_expanded
+                
+                spike_pot = []
+                for t in range(self.T):
+                    cur_input = x_expanded[t] 
+                    mem = mem + cur_input
+                    spike = self.act(mem - thre.expand_as(mem), self.gama)
+                    mem = mem - spike * thre.expand_as(mem)
+                    spike_pot.append(spike)
+                
+                x = torch.stack(spike_pot, dim=0)
+                x = self.merge(x) 
+                
+            else:  
+                x = x / self.thresh
+                x = torch.clamp(x, 0, 1)
+                x = torch.floor(x * self.L + 0.5) / self.L
+            
+            return x
+        return patched_forward
+
+    for if_name, bias_names in bias_mapping.items():
+        module = None
+        for name, mod in model_copy.named_modules():
+            if name == if_name:
+                module = mod
+                break
+        
+        if module is not None and hasattr(module, 'thresh'):
+            patched_forward_method = create_patched_forward(bias_names, bias_cache)
+            module.forward = patched_forward_method.__get__(module, type(module))
+            if bias_names:
+                print(f"{if_name}")
+
+    with torch.no_grad():
+        all_used_bias = set()
+        for bias_names in bias_mapping.values():
+            all_used_bias.update(bias_names)
+        for bias_name in all_used_bias:
+            if bias_name in model_copy.state_dict():
+                model_copy.state_dict()[bias_name].zero_()
+    
+    return model_copy
