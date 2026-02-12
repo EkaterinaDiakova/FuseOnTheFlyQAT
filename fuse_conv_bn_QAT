@@ -1,0 +1,205 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import copy
+
+def fuse_conv_bn(conv, bn):
+    fused_conv = nn.Conv2d(
+        conv.in_channels, conv.out_channels, kernel_size=conv.kernel_size,
+        stride=conv.stride, padding=conv.padding, dilation=conv.dilation,
+        groups=conv.groups, bias=True
+    ).to(conv.weight.device)
+    
+    fused_conv.weight.data = conv.weight.data.clone()
+    if conv.bias is not None:
+        fused_conv.bias.data = conv.bias.data.clone()
+    else:
+        fused_conv.bias.data.zero_()
+    
+    bn_mean = bn.running_mean
+    bn_var_sqrt = torch.sqrt(bn.running_var + bn.eps)
+    bn_weight = bn.weight
+    bn_bias = bn.bias
+    
+    scale_factor = bn_weight / bn_var_sqrt
+    fused_conv.weight.data *= scale_factor.view(-1, 1, 1, 1)
+    fused_conv.bias.data = (fused_conv.bias.data - bn_mean) * scale_factor + bn_bias
+    return fused_conv
+
+def fuse_all_conv_bn_pairs(module):
+    for child_name, child in module.named_children():
+        fuse_all_conv_bn_pairs(child)
+    
+    if isinstance(module, nn.Sequential):
+        modules_to_replace = []
+        for i in range(len(module)):
+            if isinstance(module[i], nn.BatchNorm2d) and i > 0 and isinstance(module[i-1], nn.Conv2d):
+                modules_to_replace.append((i-1, i, module[i-1], module[i]))
+        
+        for conv_idx, bn_idx, conv, bn in reversed(modules_to_replace):
+            fused_conv = fuse_conv_bn(conv, bn)
+            new_modules = []
+            for j in range(len(module)):
+                if j == conv_idx:
+                    new_modules.append(fused_conv)
+                elif j == bn_idx:
+                    continue
+                else:
+                    new_modules.append(module[j])
+            module.__init__(*new_modules)
+
+def fuse_model(model):
+    fused_model = copy.deepcopy(model)
+    fuse_all_conv_bn_pairs(fused_model)
+    return fused_model
+
+class STEQuantize(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input, scale):
+        q = torch.round(input / scale).clamp(-127, 127) * scale
+        ctx.save_for_backward(input, scale, q)
+        return q
+    
+    @staticmethod
+    def backward(ctx, grad_output):
+        input, scale, q = ctx.saved_tensors
+        grad_input = grad_output.clone()
+        grad_scale = None  
+        return grad_input, grad_scale
+
+def ste_quantize(tensor, scale):
+    return STEQuantize.apply(tensor, scale)
+
+class FuseOnTheFlyQAT(nn.Module):
+    def __init__(self, model):
+        super().__init__()
+        self.original_model = model  
+        self.scales = nn.ParameterList()
+        self._initialized = False
+    
+    def initialize(self):
+        if self._initialized:
+            return
+        
+        device = next(self.original_model.parameters()).device
+        
+        conv_idx = 0
+        for name, module in self.original_model.named_modules():
+            if isinstance(module, nn.Conv2d):
+                w_abs = torch.abs(module.weight).flatten()
+                scale = torch.quantile(w_abs, 0.995) / 127  
+                self.scales.append(nn.Parameter(torch.clamp(scale, 1e-6).to(device)))
+                print(f"  [{conv_idx}] {name}: scale={scale.item():.6f}")
+                conv_idx += 1
+        
+        self._initialized = True
+    
+    def forward(self, x):
+        self.initialize()
+        
+        fused_model = fuse_model(self.original_model)
+        fused_convs = [m for n, m in fused_model.named_modules() if isinstance(m, nn.Conv2d)]
+        
+        def recursive_ste_forward(module, x_in, conv_idx=0):
+            if isinstance(module, (nn.Sequential, nn.ModuleList)):
+                for child in module:
+                    x_in, conv_idx = recursive_ste_forward(child, x_in, conv_idx)
+            elif isinstance(module, nn.Conv2d) and conv_idx < len(self.scales):
+                scale = self.scales[conv_idx]
+                q_weight = ste_quantize(module.weight, scale)
+                
+                q_bias = None
+                if module.bias is not None:
+                    q_bias = ste_quantize(module.bias, scale)
+                
+                x_out = F.conv2d(x_in, q_weight, q_bias,
+                               stride=module.stride, padding=module.padding,
+                               dilation=module.dilation, groups=module.groups)
+                conv_idx += 1
+            else:
+                try:
+                    x_out = module(x_in)
+                except:
+                    x_out = x_in
+            
+            return x_out, conv_idx
+        
+        output, processed = recursive_ste_forward(fused_model, x)
+        return output
+    
+    def parameters(self):
+        return list(self.original_model.parameters()) + list(self.scales.parameters())
+
+def validate_ste(model_qat, val_loader, device):
+    model_qat.eval()
+    correct, total = 0, 0
+    
+    with torch.no_grad():
+        for imgs, labels in val_loader:
+            imgs, labels = imgs.to(device), labels.to(device)
+            outputs = model_qat(imgs) 
+            _, predicted = outputs.max(1)
+            total += labels.size(0)
+            correct += predicted.eq(labels).sum().item()
+    
+    model_qat.train()
+    return 100. * correct / total
+
+def train_fuse_ste_qat(model_qat, train_loader, val_loader, device, epochs=10):
+    
+    model_qat = model_qat.to(device)
+    optimizer = torch.optim.Adam(model_qat.parameters(), lr=1e-3, weight_decay=1e-4)
+    criterion = nn.CrossEntropyLoss()
+    
+    ptq_acc = validate_ste(model_qat, val_loader, device)
+    print(f"PTQ Baseline: {ptq_acc:.2f}%")
+    
+    best_val = ptq_acc
+    for epoch in range(epochs):
+        model_qat.train()
+        running_loss = 0.0
+        train_correct, train_total = 0, 0
+        
+        for batch_idx, (imgs, labels) in enumerate(train_loader):
+            imgs, labels = imgs.to(device), labels.to(device)
+            
+            optimizer.zero_grad()
+            outputs = model_qat(imgs)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            
+            #torch.nn.utils.clip_grad_norm_(model_qat.parameters(), max_norm=1.0)
+            optimizer.step()
+            
+            running_loss += loss.item()
+            _, predicted = outputs.max(1)
+            train_total += labels.size(0)
+            train_correct += predicted.eq(labels).sum().item()
+            
+            if batch_idx % 50 == 0:
+                train_acc = 100. * train_correct / train_total
+                scale_sample = [f"{s.item():.4f}" for s in model_qat.scales[:3]]
+                print(f'E[{epoch:2d}]B[{batch_idx:3d}]: Loss={loss.item():.3f}, '
+                      f'Train={train_acc:.1f}%')
+        
+        val_acc = validate_ste(model_qat, val_loader, device)
+        train_acc = 100. * train_correct / train_total
+        
+        print(f'=== Epoch {epoch} === Train:{train_acc:.2f}% | '
+              f'Val:{val_acc:.2f}%')
+        
+        
+        if val_acc > best_val:
+            best_val = val_acc
+            torch.save({
+                'model_state_dict': model_qat.original_model.state_dict(),
+                'scales_state_dict': {f'scale_{i}': s for i, s in enumerate(model_qat.scales)},
+                'best_val_acc': best_val
+            }, 'best_fuse_ste_qat.pth')
+            print(f"NEW BEST: {best_val:.2f}%")
+    
+    return model_qat
+
+
+model_qat = FuseOnTheFlyQAT(model_ann)
+model_qat_trained = train_fuse_ste_qat(model_qat, train_loader, val_loader, device, epochs=10)
