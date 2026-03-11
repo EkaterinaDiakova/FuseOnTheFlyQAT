@@ -1,5 +1,5 @@
 from .ResNet import *
-from .VGG import *
+#from .VGG import *
 from .layer import *
 
 def modelpool(MODELNAME, DATANAME):
@@ -21,4 +21,5 @@ def modelpool(MODELNAME, DATANAME):
         return resnet20(num_classes=num_classes)
     else:
         print("still not support this model")
+
         exit(0)
