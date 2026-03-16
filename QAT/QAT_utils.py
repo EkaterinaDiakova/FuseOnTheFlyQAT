@@ -8,185 +8,163 @@ import torch.nn as nn
 import torch.nn.functional as F
 import copy
 
-def find_all_conv_bn_pairs(module, prefix=''):
-    pairs = []
-    for name, child in module.named_children():
-        current_path = f"{prefix}.{name}" if prefix else name
-        
-        if isinstance(child, nn.Conv2d):
-            pairs.append((current_path, child, None))
-        elif isinstance(child, nn.BatchNorm2d) and len(pairs) > 0 and pairs[-1][2] is None:
-            conv_path, conv, _ = pairs[-1]
-            pairs[-1] = (conv_path, conv, child)
-        else:
-            pairs.extend(find_all_conv_bn_pairs(child, current_path))
-    
-    return [(path, conv, bn) for path, conv, bn in pairs if bn is not None]
 
-class FusedConvBnQuantFunction(torch.autograd.Function):
-    
+def replace_all_conv_bn_pairs(module):
+    previous_path = None
+    last_conv = None
+    for current_path, child in module.named_children():
+        if isinstance(child, nn.Conv2d):
+            previous_path = current_path
+            last_conv = child
+        elif (
+            isinstance(child, nn.BatchNorm2d)
+            and last_conv is not None
+        ):
+            module.set_submodule(
+                previous_path,
+                FusedConvBnQuantLayer(
+                    original_conv_layer=last_conv,
+                    original_bn_layer=child
+                ),
+                # Check that a child named previous_path exists.
+                strict=True
+            )
+            # Replace batchnorm with a do-nothing layer.
+            module.set_submodule(
+                current_path,
+                nn.Identity(),
+                # Check that a child named previous_path exists.
+                strict=True
+            )
+            # Mark the conv layer as consumed.
+            previous_path = None
+            last_conv = None
+        else:
+            replace_all_conv_bn_pairs(child)
+
+
+class round_with_redefined_gradient(
+    torch.autograd.Function
+):
     @staticmethod
-    def forward(ctx, x, conv_weight, conv_bias, bn_weight, bn_bias, bn_running_mean, bn_running_var, bn_eps, scale, stride, padding, dilation, groups):
-        ctx.save_for_backward(x, conv_weight, conv_bias, bn_weight, bn_bias, bn_running_mean, bn_running_var, scale)
-        ctx.bn_eps = bn_eps
-        ctx.stride = stride
-        ctx.padding = padding
-        ctx.dilation = dilation
-        ctx.groups = groups
-        
+    def forward(x):
+        return torch.round(x)
+    
+    # If we do not define this,
+    # forward() gets passed (self, x)
+    # instead of just x,
+    # despite the staticmethod decorator.
+    @staticmethod
+    def setup_context(ctx, inputs, output):
+        pass
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        # Without the ctx argument,
+        # backward() complains about getting
+        # two arguments while expecting 1.
+        return grad_output
+
+
+def quantize(
+    x, scale,
+    x_min=-127, x_max=127
+):
+    x = round_with_redefined_gradient.apply(x / scale)
+    x = torch.clamp(x, x_min, x_max)
+    x = x * scale
+    return x
+
+
+def get_fused_weights_from_conv_and_nb_parameters(
+        conv_weight, conv_bias,
+        bn_weight, bn_bias, bn_running_mean, bn_running_var, bn_eps,
+    ):
         bn_scale = bn_weight / torch.sqrt(bn_running_var + bn_eps)
         bn_shift = bn_bias
         
         fused_weight = conv_weight * bn_scale.view(-1, 1, 1, 1)
-
-        q_weight = torch.round(fused_weight / scale)
-        q_weight = torch.clamp(q_weight, -127, 127)
-        q_weight = q_weight * scale
-        
 
         if conv_bias is not None:
             fused_bias = (conv_bias - bn_running_mean) * bn_scale + bn_shift
         else:
             fused_bias = -bn_running_mean * bn_scale + bn_shift
         
-        q_bias = torch.round(fused_bias / scale)
-        q_bias = torch.clamp(q_bias, -127, 127)
-        q_bias = q_bias * scale
-        
-        ctx.fused_weight = fused_weight
-        ctx.fused_bias = fused_bias
-        ctx.q_weight = q_weight
-        ctx.q_bias = q_bias
-        ctx.bn_scale = bn_scale
+        return fused_weight, fused_bias
 
-        out = F.conv2d(x, q_weight, q_bias, stride, padding, dilation, groups)
-        
-        return out
+
+class FusedConvBnQuantLayer(nn.Module):
+    def __init__(
+        self, original_conv_layer, original_bn_layer,
+        quantization_scale=None
+    ):
+        super().__init__()
+        self.original_conv_layer = original_conv_layer
+        self.original_bn_layer = original_bn_layer
+        self.quantization_scale = nn.Parameter(quantization_scale)
+
+    def get_fused_weights(self):
+        return get_fused_weights_from_conv_and_nb_parameters(
+            conv_weight=self.original_conv_layer.weight,
+            conv_bias=self.original_conv_layer.bias,
+            bn_weight=self.original_bn_layer.weight,
+            bn_bias=self.original_bn_layer.bias,
+            bn_running_mean=self.original_bn_layer.running_mean,
+            bn_running_var=self.original_bn_layer.running_var,
+            bn_eps=self.original_bn_layer.eps
+        )
     
-    @staticmethod
-    def backward(ctx, grad_output):
-        print("🔙 BACKWARD called")
-        
-        x, conv_weight, conv_bias, bn_weight, bn_bias, bn_running_mean, bn_running_var, scale = ctx.saved_tensors
-        stride = ctx.stride
-        padding = ctx.padding
-        dilation = ctx.dilation
-        groups = ctx.groups
-        bn_eps = ctx.bn_eps
-        
-        # Получаем сохраненные тензоры
-        fused_weight = ctx.fused_weight
-        fused_bias = ctx.fused_bias
-        q_weight = ctx.q_weight
-        q_bias = ctx.q_bias
-        bn_scale = ctx.bn_scale
-        
-        print(f"   grad_output shape: {grad_output.shape}")
-        print(f"   scale: {scale.item():.6f}")
-        
-        # Градиент для x
-        grad_x = F.conv2d(grad_output, q_weight, None, stride, padding, dilation, groups)
-        
-        # Упрощенные градиенты для scale
-        grad_scale = grad_output.mean() * 0.001
-        print(f"   grad_scale: {grad_scale.item():.6f}")
-        
-        # Градиенты для conv_weight
-        grad_conv_weight = F.conv2d(x.transpose(0,1), grad_output.transpose(0,1), None, stride, padding, dilation, groups).transpose(0,1)
-        grad_conv_weight = grad_conv_weight * bn_scale.view(-1, 1, 1, 1) * 0.01
-        
-        # Градиенты для conv_bias
-        grad_conv_bias = None
-        if conv_bias is not None:
-            grad_conv_bias = grad_output.sum(dim=(0,2,3)) * bn_scale * 0.01
-        
-        # Упрощенные градиенты для BN
-        grad_bn_weight = grad_output.mean() * 0.001
-        grad_bn_bias = grad_output.mean() * 0.001
-        
-        # Градиенты для статистик BN (не нужны)
-        grad_bn_running_mean = None
-        grad_bn_running_var = None
-        
-        return (grad_x, grad_conv_weight, grad_conv_bias, grad_bn_weight, grad_bn_bias, 
-                grad_bn_running_mean, grad_bn_running_var, None, grad_scale, 
-                None, None, None, None)
+    def forward(self, x): #, conv_weight, conv_bias, bn_weight, bn_bias, bn_running_mean, bn_running_var, bn_eps, scale, stride, padding, dilation, groups):
+        fused_weight, fused_bias = self.get_fused_weights()
+        return F.conv2d(
+            input=x,
+            weight=quantize(fused_weight, scale=self.quantization_scale),
+            bias=quantize(fused_bias, scale=self.quantization_scale),
+            stride=self.original_conv_layer.stride,
+            padding=self.original_conv_layer.padding,
+            dilation=self.original_conv_layer.dilation,
+            groups=self.original_conv_layer.groups
+        )
     
+    def initialize_scale(self):
+        # Though not necessary,
+        # let's wrap it in no_grad()
+        # just in the hope for speedup.
+        with torch.no_grad():
+            fused_weight, fused_bias = self.get_fused_weights()
+            w_abs = torch.abs(fused_weight).flatten()
+            scale_val = torch.quantile(w_abs, 0.995) / 127
+            # Reaching the scale through its data attribute
+            # should be enough to side-step the autograd system.
+            self.quantization_scale.data = torch.clamp(scale_val, 1e-6)
+
+
+def initialize_scale_if_a_fused_layer(module):
+    if isinstance(module, FusedConvBnQuantLayer):
+        module.initialize_scale()
+        print(f"scale={module.quantization_scale.item():.6f} (from fused weight)")
+
+        
 class FuseOnTheFlyQAT(nn.Module):
     def __init__(self, model):
         super().__init__()
-        self.original_model = model  
-        self.scales = nn.ParameterList()
-        self._initialized = False
-        self.conv_bn_pairs = []
+        self.original_model = model
+        replace_all_conv_bn_pairs(self.original_model)
+        self.original_model.apply(
+            initialize_scale_if_a_fused_layer
+        )
         
-    def initialize(self):
-        if self._initialized:
-            return
-        
-        device = next(self.original_model.parameters()).device
-        
-        self.conv_bn_pairs = find_all_conv_bn_pairs(self.original_model)
-        
-        print(f"Found {len(self.conv_bn_pairs)} Conv+BN pairs:")
-        for i, (path, conv, bn) in enumerate(self.conv_bn_pairs):
-            with torch.no_grad():
-                bn_scale = bn.weight / torch.sqrt(bn.running_var + bn.eps)
-                fused_weight = conv.weight * bn_scale.view(-1, 1, 1, 1)
-                w_abs = torch.abs(fused_weight).flatten()
-                scale_val = torch.quantile(w_abs, 0.995) / 127  
-            
-            scale_param = nn.Parameter(torch.clamp(scale_val, 1e-6).to(device))
-            self.scales.append(scale_param)
-            print(f"  [{i}] {path}: scale={scale_val.item():.6f} (from fused weight)")
-        
-        print(f"Initialized with {len(self.scales)} scale parameters")
-        self._initialized = True
-    
     def forward(self, x):
-        self.initialize()
-        
-        def forward_with_fuse(module, x_input):
-            if isinstance(module, nn.Sequential):
-                for child in module:
-                    x_input = forward_with_fuse(child, x_input)
-                return x_input
-            elif isinstance(module, nn.Conv2d):
-                for idx, (path, conv, bn) in enumerate(self.conv_bn_pairs):
-                    if conv is module:
-                        scale = self.scales[idx]
-
-                        out = FusedConvBnQuantFunction.apply(
-                            x_input,
-                            conv.weight,
-                            conv.bias,
-                            bn.weight,
-                            bn.bias,
-                            bn.running_mean,
-                            bn.running_var,
-                            bn.eps,
-                            scale,
-                            conv.stride,
-                            conv.padding,
-                            conv.dilation,
-                            conv.groups
-                        )
-                        return out
-
-                return module(x_input)
-            else:
-                try:
-                    return module(x_input)
-                except Exception as e:
-                    return x_input
-        
-        return forward_with_fuse(self.original_model, x)
-    
-    def parameters(self):
-        return list(self.original_model.parameters()) + list(self.scales.parameters())
+        return self.original_model.forward(x)
     
     def get_scales_stats(self):
-        return {f'scale_{i}': s.item() for i, s in enumerate(self.scales)}
+        return {
+            f'{name}.scale'
+            : module.quantization_scale.item()
+            for name, module in self.named_modules()
+            if isinstance(module, FusedConvBnQuantLayer)
+        }
+        
 
 def validate_ste(model_qat, val_loader, device):
     model_qat.eval()
@@ -208,9 +186,8 @@ def train_fuse_ste_qat(model_qat, train_loader, val_loader, device, epochs=10):
     print("="*60)
     
     model_qat = model_qat.to(device)
-    model_qat.initialize()
     
-    print(f"\nParameters: {len(list(model_qat.original_model.parameters()))} non-scale, {len(model_qat.scales)} scale parameters")
+    # print(f"\nParameters: {len(list(model_qat.original_model.parameters()))} non-scale, {len(model_qat.scales)} scale parameters")
     
     optimizer = torch.optim.AdamW(model_qat.parameters(), lr=1e-3, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
@@ -238,12 +215,15 @@ def train_fuse_ste_qat(model_qat, train_loader, val_loader, device, epochs=10):
             if batch_idx % 10 == 0:
                 print(f"\n--- Batch {batch_idx} ---")
                 has_grads = False
-                for i, s in enumerate(model_qat.scales[:3]):
+                for name, layer in model_qat.named_modules():
+                    if not isinstance(layer, FusedConvBnQuantLayer):
+                        continue
+                    s = layer.quantization_scale
                     if s.grad is not None:
                         has_grads = True
-                        print(f"    scale_{i}: value={s.item():.6f}, grad={s.grad.item():.6f}")
+                        print(f"    {name}.scale: value={s.item():.6f}, grad={s.grad.item():.6f}")
                     else:
-                        print(f"    scale_{i}: grad is None")
+                        print(f"    {name}.scale: grad is None")
                 
                 if not has_grads:
                     print("NO GRADIENTS FOR ANY SCALE!")
@@ -277,7 +257,7 @@ def train_fuse_ste_qat(model_qat, train_loader, val_loader, device, epochs=10):
             best_val = val_acc
             torch.save({
                 'model_state_dict': model_qat.original_model.state_dict(),
-                'scales': {f'scale_{i}': s.detach().cpu() for i, s in enumerate(model_qat.scales)},
+                'scales': model_qat.get_scales_stats(),
                 'best_val_acc': best_val
             }, 'best_fuse_ste_qat.pth')
             print(f"NEW BEST: {best_val:.2f}%")
